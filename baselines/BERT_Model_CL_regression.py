@@ -8,6 +8,8 @@ import copy
 import datetime
 import sys
 import numpy as np
+import pandas as pd
+from numpy import cov 
 logger = logging.getLogger(__name__)
 import torch.nn as nn
 import transformers
@@ -22,6 +24,9 @@ from transformers import AdamW, get_linear_schedule_with_warmup
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.metrics import confusion_matrix
 from sklearn.metrics import classification_report, f1_score
+from sklearn.metrics import mean_squared_error
+from scipy.stats import pearsonr
+
 
 PRETRAINED_MODEL_MAP = {'bert': BertModel}
 
@@ -95,6 +100,12 @@ class InputExample(object):
 	def to_json_string(self):
 		return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
 
+# def pearson_cf(y_true, y_pred):
+# 		a = y_true - K.mean(y_true)
+# 		b = y_pred - K.mean(y_pred)
+# 		num = K.sum(a * b)
+# 		den = K.sqrt(K.sum(a**2) * K.sum(b**2))
+# 		return (num/(den+0.00001))
 
 class InputFeatures(object):
 	def __init__(self, input_ids, attention_mask, token_type_ids, label_id):
@@ -117,7 +128,7 @@ class InputFeatures(object):
 class mydataProcessor(object):
 	def __init__(self, args):
 		self.args = args
-		self.relation_labels = get_label()
+		# self.relation_labels = get_label()
 	@classmethod
 	def _read_csv(cls, input_file, quotechar=None):
 		with open(input_file, "r", encoding="utf-8") as f:
@@ -134,7 +145,8 @@ class mydataProcessor(object):
 			text_a = line[0]
 			text_b = line[1]
 			#print(line[0],'--------',line[1],'--------',line[2])
-			label = self.relation_labels.index(line[2])
+			# label = self.relation_labels.index(line[2])
+			label=float((line[2].split(":")[1]).strip(" "))
 			if i % 1000 == 0:
 				logger.info(line)
 			examples.append(InputExample(guid=guid, text_a=text_a,text_b=text_b, label=label))
@@ -212,8 +224,8 @@ def convert_examples_to_features(examples,max_seq_len,tokenizer,cls_token="[CLS]
 		assert (len(attention_mask) == max_seq_len), "Error with attention mask length {} vs {}".format(len(attention_mask), max_seq_len)
 		assert (len(token_type_ids) == max_seq_len), "Error with token type length {} vs {}".format(len(token_type_ids), max_seq_len)
 
-
-		label_id = int(example.label)
+		# print(example.label)
+		label_id = example.label
 
 		if ex_index < 5:
 			logger.info("*** Example ***")
@@ -247,7 +259,7 @@ def load_and_cache_examples(args,tokenizer,mode):
 	all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
 	all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
 
-	all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
+	all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.float)
 
 	dataset = TensorDataset(all_input_ids,all_attention_mask,all_token_type_ids,all_label_ids,)
 	return dataset
@@ -259,8 +271,8 @@ MODEL_PATH_MAP = {"bert": "bert-base-uncased",}
 
 
 
-def get_label():
-	return ["false", "true"]
+# def get_label():
+# 	return ["No", "Yes"]
 
 
 def load_tokenizer(args):
@@ -270,7 +282,7 @@ def load_tokenizer(args):
 
 
 def write_prediction(args, output_file, preds,orinal_label):
-	relation_labels = get_label()
+	# relation_labels = get_label()
 	rd_test_data=open(os.path.join(args.data_dir,args.test_file),'r',encoding='utf-8')
 	reader = csv.reader(rd_test_data, delimiter="\t", quotechar=None)
 	lines = []
@@ -314,8 +326,8 @@ class Trainer(object):
 		self.dev_dataset = dev_dataset
 		self.test_dataset = test_dataset
 
-		self.label_lst = get_label()
-		self.num_labels = len(self.label_lst)
+		# self.label_lst = get_label()
+		self.num_labels = 1
 
 		self.config_class, self.model_class, _ = MODEL_CLASSES[args.model_type]
 		self.config = self.config_class.from_pretrained(args.model_name_or_path,num_labels=self.num_labels,)
@@ -370,7 +382,7 @@ class Trainer(object):
 		global_step = 0
 		tr_loss = 0.0
 		self.model.zero_grad()
-		best_val_f1 = -1
+		best_mse_loss = 999
 		train_iterator = trange(int(self.args.num_train_epochs), desc="Epoch")
 
 		for _ in train_iterator:
@@ -399,11 +411,11 @@ class Trainer(object):
 				if 0 < self.args.max_steps < global_step:
 					epoch_iterator.close()
 					break
-			valid_report, valid_f1 = self.evaluate("dev")
+			mse_loss= self.evaluate("dev")
 			# print(valid_f1,best_val_f1)
-			if valid_f1 > best_val_f1:
+			if mse_loss < best_mse_loss:
 				logger.info("Best validation score, saving best model")
-				best_val_f1=valid_f1
+				best_mse_loss=mse_loss
 				self.save_model()
 			else:
 				logger.info("Not the best validation score, not overwriting best model")
@@ -412,7 +424,6 @@ class Trainer(object):
 				train_iterator.close()
 				break
 		return global_step, tr_loss / global_step
-
 	def evaluate(self, mode):
 		if mode == "test":
 			dataset = self.test_dataset
@@ -453,55 +464,78 @@ class Trainer(object):
 
 		eval_loss = eval_loss / nb_eval_steps
 		results = {"loss": eval_loss}
-		preds = np.argmax(preds, axis=1)
-		result = compute_metrics(preds, out_label_ids)
+		# preds = np.argmax(preds, axis=1)
+
+		mse_loss = mean_squared_error(out_label_ids,preds)
+		print(mse_loss)
+		actual = []
+		predicted = []
 		if mode =='test':
 			#------------------------------------------------------------------------------------------
+			#pcc = pearson_cf(out_label_ids, preds)
+			#print('Pearson Corelation co-efficient::', pcc)
+			#corr, _ = pearsonr([out_label_ids], [preds])
+			#print('Pearsons correlation: %.3f' % corr)
+			for p in preds:
+				predicted.append(p[0])
+			for q in out_label_ids:
+				actual.append(q)
+			
+			print(preds)
+			print(out_label_ids)
+
 			write_prediction(self.args, os.path.join(self.args.eval_dir, "proposed_answers_Train_Test_13_02_2021_run_"+fold+".txt"), preds,out_label_ids)
 			#calculating accuracy manually
+
 			res=open(os.path.join(self.args.eval_dir, "Results_Train_Test_13_02_2021_run_"+fold+".txt"),'w',encoding='utf-8')
-			count=0
-			count_p=0
-			count_n=0
-			i=0
+			# count=0
+			# count_p=0
+			# count_n=0
+			# i=0
 
-			ori_p=0
-			ori_n=0
+			# ori_p=0
+			# ori_n=0
 
-			while(i<len(out_label_ids)):
-				if(out_label_ids[i]==1):
-					ori_p+=1
-				elif(out_label_ids[i]==0):
-					ori_n+=1
-				if(preds[i]==out_label_ids[i]):
-					count+=1
-					if(out_label_ids[i]==1):
-						count_p+=1
-					elif(out_label_ids[i]==0):
-						count_n+=1
-				i+=1
+			# while(i<len(out_label_ids)):
+			# 	if(out_label_ids[i]==1):
+			# 		ori_p+=1
+			# 	elif(out_label_ids[i]==0):
+			# 		ori_n+=1
+			# 	if(preds[i]==out_label_ids[i]):
+			# 		count+=1
+			# 		if(out_label_ids[i]==1):
+			# 			count_p+=1
+			# 		elif(out_label_ids[i]==0):
+			# 			count_n+=1
+			# 	i+=1
 
-			res.write("Number of YES correctly predicted = "+str(count_p)+ " out of "+str(ori_p)+" YES sentences\n")
-			res.write("Number of NO correctly predicted = "+str(count_n)+ " out of "+str(ori_n)+" NO sentences\n")
+			# res.write("Number of YES correctly predicted = "+str(count_p)+ " out of "+str(ori_p)+" YES sentences\n")
+			# res.write("Number of NO correctly predicted = "+str(count_n)+ " out of "+str(ori_n)+" NO sentences\n")
 
-			res.write('\n\n\n')
+			# res.write('\n\n\n')
 
 			res.write("***********************************\n")
-			res.write("BERT_DLND_Novelty Detection"+"\n")
+			res.write("BERT_TAP2.0_Novelty Detection"+"\n")
 			res.write("***********************************\n")
-			res.write(result['f1'])
-			res.write("accuracy : " + str(result['acc']))
+			res.write(str(mse_loss)+'\n')
+			# res.write("accuracy : " + str(result['acc']))
 			#----------------------------------------------------------------------------------------------
+		print(len(actual))
+		print(len(predicted))
 
-		results.update(result)
+		data_dict ={'Actual':actual,'Predicted':predicted}
+		df=pd.DataFrame.from_dict(data_dict)
+		df.to_csv('TAP2-output_5.csv',index=True,sep='\t')
+
+		#results.update(result)
 		logger.info("***** Eval results *****")
-		for key in sorted(results.keys()):
-			print(key,results[key])
-			#logger.info("  {} = {:.4f}".format(key, results[key]))
-		report = classification_report(out_label_ids, preds, digits=4)
-		f1 = f1_score(out_label_ids, preds)
-		print(report)
-		return report, f1
+		# for key in sorted(results.keys()):
+		# 	print(key,results[key])
+		# 	#logger.info("  {} = {:.4f}".format(key, results[key]))
+		# # report = classification_report(out_label_ids, preds, digits=4)
+		# # f1 = f1_score(out_label_ids, preds)
+		# # print(report)
+		return mse_loss
 
 	def save_model(self):
 		model_to_save = (self.model.module if hasattr(self.model, "module") else self.model)
@@ -540,12 +574,12 @@ if __name__ == "__main__":
 	parser.add_argument("--data_dir",default="Data/",type=str,help="The input data dir. Should contain the .tsv files (or other data files) for the task.",)
 	parser.add_argument("--model_dir", default='Model1/', type=str, help="Path to model")
 	parser.add_argument("--eval_dir",default='Result/',type=str,help="Evaluation script, result directory",)
-	parser.add_argument("--train_file", default="Train_APWSJ_Fold_"+fold+".csv", type=str, help="Train file")
-	parser.add_argument("--dev_file", default="Dev_APWSJ_Fold_"+fold+".csv", type=str, help="Dev file")
-	parser.add_argument("--test_file", default="Test_APWSJ_Fold_"+fold+".csv", type=str, help="Test file")
+	parser.add_argument("--train_file", default="Train_TAP2.0_Fold_"+fold+".csv", type=str, help="Train file")
+	parser.add_argument("--dev_file", default="Dev_TAP2.0_Fold_"+fold+".csv", type=str, help="Dev file")
+	parser.add_argument("--test_file", default="Test_TAP2.0_Fold_"+fold+".csv", type=str, help="Test file")
 	parser.add_argument("--model_type",default="bert",type=str,help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()),)
 	parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
-	parser.add_argument("--train_batch_size", default=8, type=int, help="Batch size for training.")
+	parser.add_argument("--train_batch_size", default=4, type=int, help="Batch size for training.")
 	parser.add_argument("--eval_batch_size", default=32, type=int, help="Batch size for evaluation.")
 	parser.add_argument("--max_seq_len",default=512,type=int,help="The maximum total input sequence length after tokenization.",)
 	parser.add_argument("--learning_rate",default=2e-5,type=float,help="The initial learning rate for Adam.",)
